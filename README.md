@@ -11,6 +11,7 @@ Tooling for training and serving LoRA adapters on
 | `packed_data.py` | Packed-window collator: block-diagonal 4D attention masks, per-segment position ids, first-token label masking. |
 | `ripple_lora_plugin.py` | Registers a `SupportsLoRA` subclass of vLLM's ricursive model at runtime. No vLLM rebuild required. |
 | `validate_vllm_stage.py`, `validate_hf_stage.py` | Correctness check for the plugin: compares per-token adapter deltas (logprob with adapter minus without) between vLLM and transformers+PEFT. |
+| `merge_lora_to_gguf.py` | Merges an adapter into the base weights inside llama.cpp's HF-to-GGUF conversion, streaming tensor by tensor; no merged HF checkpoint is written. |
 
 ## Versions
 
@@ -63,3 +64,25 @@ q/k/v/o/gate/up/down (`g_proj` absent from the packed `qkg` module). Result on
 0.013 (the base models alone differ by 0.018 between the two engines).
 Other configurations (multiple adapters, other TP degrees, ranks above 64,
 embedding or bias LoRAs) are untested; run the validator before relying on them.
+
+## GGUF
+
+`merge_lora_to_gguf.py` wraps llama.cpp's `convert_hf_to_gguf.py`. While the converter streams the
+base checkpoint, every tensor the adapter targets gets `W + scale * (B @ A)` added in fp32 and is cast
+back to the base dtype (`scale = alpha / sqrt(r)` for rsLoRA adapters, `alpha / r` otherwise).
+Requirements: a llama.cpp checkout with `RicursiveForCausalLM` support and its converter dependencies
+(`requirements/requirements-convert_hf_to_gguf.txt`), plus `safetensors`.
+
+```
+python merge_lora_to_gguf.py --llama-cpp path/to/llama.cpp --adapter path/to/adapter \
+  path/to/Ripple-65B-Base-Preview --outtype q8_0 --split-max-size 45G --outfile merged-Q8_0.gguf
+
+path/to/llama.cpp/build/bin/llama-quantize --allow-requantize \
+  merged-Q8_0-00001-of-00002.gguf merged-Q4_K_M.gguf Q4_K_M
+```
+
+All arguments other than `--llama-cpp` and `--adapter` go to the converter unchanged
+(`--split-max-size 45G` keeps each file under the Hugging Face 50 GB limit; `--no-lazy` converts faster
+but needs RAM for the whole model). The run must end with a `MERGE_OK` line, which is printed only when
+every adapter tensor pair was applied. A cheap end-to-end check is `llama-perplexity` on held-out text:
+the merged file must reproduce the adapter's loss drop against the base.
