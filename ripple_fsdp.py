@@ -76,8 +76,11 @@ def arguments(argv=None, stage="probe"):
     p.add_argument("--eval-batch", type=int, default=env_int("LIL_EVAL_BS", 1))
     p.add_argument("--eval-token-budget", type=int, default=env_int("LIL_EVAL_TOK_BUDGET", 15872))
     p.add_argument("--keep-checkpoints", type=int, default=2)
+    p.add_argument("--sdpa", choices=["cudnn", "auto"], default=os.environ.get("LIL_SDPA", "cudnn"),
+                   help="Attention kernel order. cudnn: try cuDNN attention first (works with the packed 4D mask; "
+                        "~2x faster attention, ~+11%% step on 4x H100). auto: PyTorch's default choice")
     p.add_argument("--forward-prefetch", action=argparse.BooleanOptionalAction,
-                   default=os.environ.get("LIL_FORWARD_PREFETCH", "0") == "1",
+                   default=os.environ.get("LIL_FORWARD_PREFETCH", "1") == "1",
                    help="FSDP forward prefetch: overlap the next unit's all-gather with compute. Same maths; "
                         "costs memory. Measured on 4x H100-80 NVLink, r128, 2048 packed, micro 4: peak 52.9 GiB")
     p.add_argument("--overflow", choices=["error", "truncate"], default="error")
@@ -226,6 +229,20 @@ def micro_indices(start, stop, world, rank, micro, accumulation):
         yield [i if i < stop else None for i in range(first, first + micro)]
 
 
+def install_sdpa_priority(mode):
+    """Make every F.scaled_dot_product_attention call (Ripple's attention included) try cuDNN first."""
+    if mode != "cudnn":
+        return
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+    original = F.scaled_dot_product_attention
+    order = [SDPBackend.CUDNN_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.FLASH_ATTENTION, SDPBackend.MATH]
+    def sdpa(*args, **kwargs):
+        with sdpa_kernel(order, set_priority=True):
+            return original(*args, **kwargs)
+    F.scaled_dot_product_attention = sdpa
+    torch.nn.functional.scaled_dot_product_attention = sdpa
+
+
 def loss_sum(logits, labels):
     # Explicit FP32 CE; sum is zero (not NaN) for an all-dummy microbatch.
     return F.cross_entropy(logits[:, :-1].float().reshape(-1, logits.shape[-1]),
@@ -306,8 +323,10 @@ def build_model(a, device):
         if state.keys() != expected.keys() or any(state[k].shape != expected[k].shape for k in state):
             raise ValueError("Warm-start adapter tensor names or shapes do not exactly match")
         set_peft_model_state_dict(peft_model, state)
-    # Separate trainable LoRA A/B leaf modules from frozen decoder parameters.
-    # Otherwise use_orig_params=True may allocate gradient storage for the frozen base.
+    # Separate trainable LoRA A/B leaf modules from frozen decoder parameters (one dtype and
+    # trainability per FSDP unit). use_orig_params=True: FSDP then pads every parameter to
+    # 16 bytes. With False, each base weight was a view at a 2-byte offset, which forced cuBLAS
+    # onto a slow fallback GEMM (cutlass_75 s1688 align1); measured ~2.9x faster aligned on 4x H100.
     trainable_leaf = functools.partial(lambda_auto_wrap_policy,
         lambda_fn=lambda m: not list(m.children()) and any(p.requires_grad for p in m.parameters(recurse=False)))
     decoder_policy = functools.partial(transformer_auto_wrap_policy, transformer_layer_cls={decoder_class})
@@ -317,7 +336,7 @@ def build_model(a, device):
     def materialize(module):
         if any(p.is_meta for p in module.parameters(recurse=False)) or any(b.is_meta for b in module.buffers(recurse=False)):
             module.to_empty(device=device, recurse=False)
-    model = FSDP(peft_model, auto_wrap_policy=policy, use_orig_params=False,
+    model = FSDP(peft_model, auto_wrap_policy=policy, use_orig_params=True,
                  sharding_strategy=ShardingStrategy.FULL_SHARD, mixed_precision=mp,
                  device_id=device, sync_module_states=not a.cpu_test,
                  param_init_fn=materialize, limit_all_gathers=True, forward_prefetch=a.forward_prefetch)
@@ -605,6 +624,7 @@ def run(a, device, tokenizer, rows, hashes, token_hashes, report, eval_sets, acc
         Path(a.output_dir).mkdir(parents=True, exist_ok=True)
         (Path(a.output_dir) / "run_config.json").write_text(json.dumps({**contract(a, world), "train_report": report}, indent=2))
     dist.barrier()
+    install_sdpa_priority(a.sdpa)
     model, peft_model, adapter_names = build_model(a, device)
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
                                   lr=a.lr, weight_decay=0.0, betas=(0.9, 0.999), eps=1e-8, foreach=False)

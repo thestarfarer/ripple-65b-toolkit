@@ -44,13 +44,25 @@ batch 16. r128 does not fit on 2x80.
 torchrun --standalone --nproc_per_node=4 train_2048.py --fresh-adapter \
   --train-file mix_2048.jsonl --data-format packed --max-length 2048 \
   --rank 128 --lr 1e-6 --warmup 100 --global-batch 16 --micro-batch 4 --eval-batch 8 \
-  --forward-prefetch --no-append-eos --save-steps 250 --output-dir out/r128
+  --no-append-eos --save-steps 250 --output-dir out/r128
 ```
 
-Measured on 4x H100-80 SXM (NVLink), r128: peak 52.9 GiB per GPU at micro-batch 4 on full
-2,048-token rows (eval batch 8 included), ~835 tokens/s, ~38 s per optimizer step of 16 rows.
-For comparison, 8x A100-80 SXM ran the same r128 2048 stage at 831 tokens/s.
-`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` was set for that run.
+Defaults that matter for speed: FSDP with `use_orig_params=True` (FSDP pads every parameter to
+16 bytes), forward prefetch on, and `--sdpa cudnn` (cuDNN attention, which accepts the packed 4D mask).
+With `use_orig_params=False` every base weight was a view at a 2-byte offset, which pushed cuBLAS onto a
+slow fallback GEMM (`cutlass_75 … s1688 … align1`, 100 vs 803 TFLOPs on an aligned weight). Measured on
+4x H100-80 SXM, r128, micro-batch 4, the 48 longest 2,048-token rows, 3 steps (same losses to rounding):
+
+| configuration | tokens/s | peak GiB/GPU |
+|---|---|---|
+| unaligned (previous release) | 882 | 52.9 |
+| aligned | ~2,560-2,615 | 53.7 |
+| aligned + cuDNN attention (default, this release) | ~2,860-2,935 | 55.3 |
+
+The full 52M-token run in the previous release ran at ~835 tokens/s on the real mix. With these defaults
+the remaining GPU time splits into matmuls ~31%, AllGather ~28% (many small collectives from the
+per-LoRA-leaf FSDP units), elementwise/copies ~24%, attention ~13%. Resumable checkpoints at r128 are
+~29 GB (4 optimizer shards + adapter), and the trainer always writes one at the end of a run.
 
 Plain-text rows get an EOS appended by default; pass `--no-append-eos` for continuation-style
 training. No BOS is ever added. Resumable checkpoints at r128 are ~29 GB (4 optimizer shards + adapter).
