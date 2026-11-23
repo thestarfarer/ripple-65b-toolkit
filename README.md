@@ -55,12 +55,6 @@ For comparison, 8x A100-80 SXM ran the same r128 2048 stage at 831 tokens/s.
 Plain-text rows get an EOS appended by default; pass `--no-append-eos` for continuation-style
 training. No BOS is ever added. Resumable checkpoints at r128 are ~29 GB (4 optimizer shards + adapter).
 
-Throughput note: at ~835 tokens/s the 4x H100 run reaches ~82 TFLOPs per GPU (~8% of bf16 peak),
-with memory controllers 11-27% busy, NVLink ~1% busy and clocks unthrottled. Ripple's attention calls
-`F.scaled_dot_product_attention` with an explicit sliding-window mask (no flash-attention support in its
-modeling code), and packed training adds a block-diagonal 4D mask; where the time goes has not been
-profiled yet.
-
 ## Serving
 
 ```python
