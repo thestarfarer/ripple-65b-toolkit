@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ordered Ripple BF16/rsLoRA training with native FSDP, launched with torchrun.
+"""Ordered Ripple BF16/rsLoRA training with FSDP2 (fully_shard), launched with torchrun.
 
 Defaults: context 512, global batch 16, r128/alpha256, LR 5e-7,
 100 warmup updates then constant LR. See README.md for installation and runs.
@@ -24,14 +24,14 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy,
-)
+from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor
+import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict, StateDictOptions
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointImpl, apply_activation_checkpointing, checkpoint_wrapper,
 )
-from torch.distributed.fsdp.wrap import _or_policy, lambda_auto_wrap_policy, transformer_auto_wrap_policy
-from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, TaskType, get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict
 from safetensors.torch import load_file, save_file
@@ -40,7 +40,7 @@ from packed_data import PackedCollator, encode_packed_file, detect_format
 BASE_MODEL = "ricursiveAI/Ripple-65B-Base-Preview"
 BASE_REVISION = "6187d1108a25fcc31681ec942ec3c581721b9fe1"
 TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3  # FSDP2 + torch.distributed.checkpoint
 STOP_REQUESTED = False
 
 
@@ -289,14 +289,12 @@ def build_model(a, device):
         raise ValueError("CPU test fixture must have hidden_size <=128 and <=8 layers")
     dtype = torch.float32 if a.cpu_test else torch.bfloat16
     config.use_cache = False
-    if rank == 0 or a.cpu_test:
-        log("Loading frozen base on rank 0 CPU; other CUDA ranks use meta initialization.")
-        base = AutoModelForCausalLM.from_pretrained(a.model, config=config, dtype=dtype,
-                                           low_cpu_mem_usage=True, attn_implementation="sdpa",
-                                           trust_remote_code=True, **revision_kwargs(a))
-    else:
-        with init_empty_weights(include_buffers=True):
-            base = AutoModelForCausalLM.from_config(config, trust_remote_code=True).to(dtype=dtype)
+    # FSDP2: every rank loads the base (safetensors are memory-mapped from the page cache) and
+    # shards it; no rank-0 broadcast.
+    log("Loading frozen base on CPU on every rank (memory-mapped).")
+    base = AutoModelForCausalLM.from_pretrained(a.model, config=config, dtype=dtype,
+                                               low_cpu_mem_usage=True, attn_implementation="sdpa",
+                                               trust_remote_code=True, **revision_kwargs(a))
     base.config.use_cache = False
     # Class patch is also present on every rank; inference exports remain ordinary PEFT adapters.
     type(base.model)._update_causal_mask = ripple_causal_mask
@@ -305,10 +303,7 @@ def build_model(a, device):
                       target_modules=TARGETS + (["g_proj"] if a.include_attention_gate else []),
                       bias="none", task_type=TaskType.CAUSAL_LM,
                       base_model_name_or_path=a.model, revision=None if Path(a.model).is_dir() else a.revision)
-    # Meta adapters must be materialized by FSDP, then broadcast from rank 0.
-    context = init_empty_weights(include_buffers=True) if rank != 0 and not a.cpu_test else contextlib.nullcontext()
-    with context:
-        peft_model = get_peft_model(base, lora)
+    peft_model = get_peft_model(base, lora)
     for param in peft_model.parameters():
         if param.requires_grad:
             param.data = param.data.float()  # FP32 persistent adapter weights/gradients/Adam moments
@@ -317,37 +312,30 @@ def build_model(a, device):
         raise RuntimeError("Unexpected trainable base parameters")
     count = sum(p.numel() for p in peft_model.parameters() if p.requires_grad)
     log(f"rsLoRA r={a.rank}, alpha={a.alpha}, scale={a.alpha/math.sqrt(a.rank):.8f}; trainable={count:,}")
-    if a.init_adapter and (rank == 0 or a.cpu_test):
+    if a.init_adapter:
         state = validate_adapter(a.init_adapter, a)
         expected = get_peft_model_state_dict(peft_model, save_embedding_layers=False)
         if state.keys() != expected.keys() or any(state[k].shape != expected[k].shape for k in state):
             raise ValueError("Warm-start adapter tensor names or shapes do not exactly match")
         set_peft_model_state_dict(peft_model, state)
-    # Separate trainable LoRA A/B leaf modules from frozen decoder parameters (one dtype and
-    # trainability per FSDP unit). use_orig_params=True: FSDP then pads every parameter to
-    # 16 bytes. With False, each base weight was a view at a 2-byte offset, which forced cuBLAS
-    # onto a slow fallback GEMM (cutlass_75 s1688 align1); measured ~2.9x faster aligned on 4x H100.
-    trainable_leaf = functools.partial(lambda_auto_wrap_policy,
-        lambda_fn=lambda m: not list(m.children()) and any(p.requires_grad for p in m.parameters(recurse=False)))
-    decoder_policy = functools.partial(transformer_auto_wrap_policy, transformer_layer_cls={decoder_class})
-    policy = functools.partial(_or_policy, policies=[trainable_leaf, decoder_policy])
-    mp = None if a.cpu_test else MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32,
-                                               buffer_dtype=torch.bfloat16, cast_forward_inputs=True)
-    def materialize(module):
-        if any(p.is_meta for p in module.parameters(recurse=False)) or any(b.is_meta for b in module.buffers(recurse=False)):
-            module.to_empty(device=device, recurse=False)
-    model = FSDP(peft_model, auto_wrap_policy=policy, use_orig_params=True,
-                 sharding_strategy=ShardingStrategy.FULL_SHARD, mixed_precision=mp,
-                 device_id=device, sync_module_states=not a.cpu_test,
-                 param_init_fn=materialize, limit_all_gathers=True, forward_prefetch=a.forward_prefetch)
-    apply_activation_checkpointing(model,
+    # FSDP2: one fully_shard group per decoder layer with its LoRA tensors inside (one all-gather per
+    # layer instead of one per LoRA leaf), then the root (embeddings, final norm, lm_head). Per-parameter
+    # sharding keeps every parameter's storage aligned. Activation checkpointing wraps layers first.
+    apply_activation_checkpointing(peft_model,
         checkpoint_wrapper_fn=functools.partial(checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT),
         check_fn=lambda module: isinstance(module, decoder_class))
-    # Exactly one uniform trainability/dtype group per FSDP unit.
-    for unit in FSDP.fsdp_modules(model):
-        direct = list(unit.parameters(recurse=False))
-        if direct and len({p.requires_grad for p in direct}) != 1:
-            raise RuntimeError("Mixed frozen/trainable FSDP unit")
+    mesh = init_device_mesh(device.type, (dist.get_world_size(),))
+    mp = None if a.cpu_test else MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+    kw = {"mesh": mesh, "reshard_after_forward": True}
+    if mp is not None:
+        kw["mp_policy"] = mp
+    for module in peft_model.modules():
+        if isinstance(module, decoder_class):
+            module.to(device)
+            fully_shard(module, **kw)
+    peft_model.to(device)
+    fully_shard(peft_model, **kw)
+    model = peft_model
     return model, peft_model, adapter_names
 
 
@@ -427,20 +415,16 @@ def lr_for_update(step, peak, warmup):
 
 
 def export_adapter(model, peft_model, adapter_names, tokenizer, output, a):
-    """Gather only LoRA leaf FSDP units. Never summon the frozen model."""
+    """Gather only the LoRA parameters (DTensor.full_tensor on every rank). Never the frozen model."""
     raw = {}
     rank = dist.get_rank()
-    for name, unit in model.named_modules():
-        if not isinstance(unit, FSDP) or not isinstance(unit.module, torch.nn.Linear):
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
             continue
-        clean_name = canonical(name)
-        if ".lora_A." not in clean_name and ".lora_B." not in clean_name:
-            continue
-        with FSDP.summon_full_params(unit, recurse=False, writeback=False, rank0_only=True,
-                                     offload_to_cpu=not a.cpu_test):
-            if rank == 0:
-                for key, value in unit.module.named_parameters():
-                    raw[f"{clean_name}.{key}"] = value.detach().cpu().contiguous().clone()
+        full = param.full_tensor() if isinstance(param, DTensor) else param
+        if rank == 0:
+            raw[canonical(name)] = full.detach().cpu().contiguous().clone()
+        del full
     if rank == 0:
         if sorted(raw) != adapter_names:
             raise RuntimeError("Adapter export missed or renamed tensors: "
@@ -469,10 +453,10 @@ def save_checkpoint(model, peft_model, adapter_names, tokenizer, optimizer, a, d
         temporary.mkdir(parents=True)
     dist.barrier()
     # Save RNG before export; restore it after resume so checkpoint work is transparent.
-    payload = {"trainable_shards": {n: p.detach().cpu().clone() for n, p in model.named_parameters() if p.requires_grad},
-               "optimizer": optimizer.state_dict(), "rng": rng_state(device)}
-    torch.save(payload, temporary / f"rank-{rank:05d}.pt")
-    del payload
+    model_sd, optim_sd = get_state_dict(model, optimizer, options=StateDictOptions(ignore_frozen_params=True))
+    dcp.save({"model": model_sd, "optim": optim_sd}, checkpoint_id=str(temporary / "dcp"))
+    del model_sd, optim_sd
+    torch.save({"rng": rng_state(device)}, temporary / f"rank-{rank:05d}.pt")
     export_adapter(model, peft_model, adapter_names, tokenizer, temporary / "adapter", a)
     if rank == 0:
         state = {"contract": contract(a, world), "step": step, "cursor": cursor,
@@ -490,18 +474,15 @@ def save_checkpoint(model, peft_model, adapter_names, tokenizer, optimizer, a, d
 
 def load_checkpoint(path, model, optimizer, device):
     # Only load checkpoints made by this script and trusted by the user.
-    state = torch.load(path / f"rank-{dist.get_rank():05d}.pt", map_location="cpu", weights_only=False)
-    parameters = {n: p for n, p in model.named_parameters() if p.requires_grad}
-    if parameters.keys() != state["trainable_shards"].keys():
-        raise ValueError("FSDP parameter layout differs from the saved checkpoint")
-    with torch.no_grad():
-        for name, parameter in parameters.items():
-            saved = state["trainable_shards"][name]
-            if parameter.shape != saved.shape or parameter.dtype != saved.dtype:
-                raise ValueError(f"FSDP shard shape/dtype changed: {name}")
-            parameter.copy_(saved)
-    optimizer.load_state_dict(state["optimizer"])
-    restore_rng(state["rng"], device)
+    # strict=False: the checkpoint holds only trainable (LoRA) tensors, never the frozen base.
+    # dcp.load itself fails if any requested trainable tensor is missing from the checkpoint.
+    options = StateDictOptions(ignore_frozen_params=True, strict=False)
+    model_sd, optim_sd = get_state_dict(model, optimizer, options=options)
+    state = {"model": model_sd, "optim": optim_sd}
+    dcp.load(state, checkpoint_id=str(path / "dcp"))
+    set_state_dict(model, optimizer, model_state_dict=state["model"], optim_state_dict=state["optim"], options=options)
+    rng = torch.load(path / f"rank-{dist.get_rank():05d}.pt", map_location="cpu", weights_only=False)
+    restore_rng(rng["rng"], device)
     dist.barrier()
 
 
@@ -668,7 +649,9 @@ def run(a, device, tokenizer, rows, hashes, token_hashes, report, eval_sets, acc
             running_loss += summed.detach().double()
             del logits, summed, labels, batch
             # Deliberately no no_sync(): retain sharded gradients during accumulation.
-        norm = model.clip_grad_norm_(1.0)
+        norm = torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
+        if isinstance(norm, DTensor):
+            norm = norm.full_tensor()
         if not torch.isfinite(norm).item():
             raise FloatingPointError("Non-finite gradient norm; checkpoint from the previous completed update remains usable")
         optimizer.step()
