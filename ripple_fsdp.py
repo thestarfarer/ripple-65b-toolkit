@@ -76,6 +76,10 @@ def arguments(argv=None, stage="probe"):
     p.add_argument("--eval-batch", type=int, default=env_int("LIL_EVAL_BS", 1))
     p.add_argument("--eval-token-budget", type=int, default=env_int("LIL_EVAL_TOK_BUDGET", 15872))
     p.add_argument("--keep-checkpoints", type=int, default=2)
+    p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=os.environ.get("LIL_COMPILE", "1") == "1",
+                   help="torch.compile each decoder layer (eager-matching bf16 rounding). ~+17-30%% tok/s on 4x H100")
+    p.add_argument("--compile-cache", default=os.environ.get("TORCHINDUCTOR_CACHE_DIR", str(Path.home() / ".cache" / "ripple_inductor")),
+                   help="Inductor/Triton cache; must be on a filesystem that allows executables (not a noexec /dev/shm)")
     p.add_argument("--sdpa", choices=["cudnn", "auto"], default=os.environ.get("LIL_SDPA", "cudnn"),
                    help="Attention kernel order. cudnn: try cuDNN attention first (works with the packed 4D mask; "
                         "~2x faster attention, ~+11%% step on 4x H100). auto: PyTorch's default choice")
@@ -321,6 +325,18 @@ def build_model(a, device):
     # FSDP2: one fully_shard group per decoder layer with its LoRA tensors inside (one all-gather per
     # layer instead of one per LoRA leaf), then the root (embeddings, final norm, lm_head). Per-parameter
     # sharding keeps every parameter's storage aligned. Activation checkpointing wraps layers first.
+    if a.compile and not a.cpu_test:
+        # Compile the layer maths only (before checkpoint wrapping and fully_shard, so FSDP's
+        # gathering stays outside the compiled region). emulate_precision_casts keeps eager's
+        # bf16 rounding of intermediates; without it losses and grad norms drift from eager.
+        os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", a.compile_cache)
+        os.environ.setdefault("TRITON_CACHE_DIR", str(Path(a.compile_cache) / "triton"))
+        import torch._inductor.config as inductor_config
+        inductor_config.emulate_precision_casts = True
+        layers = [m for m in peft_model.modules() if isinstance(m, decoder_class)]
+        for layer in layers:
+            layer.compile()
+        log(f"torch.compile on {len(layers)} decoder layers (cache {os.environ['TORCHINDUCTOR_CACHE_DIR']})")
     apply_activation_checkpointing(peft_model,
         checkpoint_wrapper_fn=functools.partial(checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT),
         check_fn=lambda module: isinstance(module, decoder_class))

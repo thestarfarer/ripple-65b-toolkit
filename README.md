@@ -64,9 +64,17 @@ same losses to rounding:
 | FSDP1, unaligned (Nov release) | 882 | 52.9 |
 | FSDP1, aligned (`use_orig_params=True`) | ~2,560-2,615 | 53.7 |
 | FSDP1, aligned + cuDNN attention | ~2,860-2,935 | 55.3 |
-| **FSDP2 + cuDNN attention (this release)** | **~3,260-3,350** | **55.7** |
+| FSDP2 + cuDNN attention | ~3,260-3,350 | 55.7 |
+| **FSDP2 + cuDNN + `torch.compile` per layer (this release, default)** | **~3,900-4,340** | **54.8** |
 
-Verified for this release: save, resume (step-3 loss identical to an uninterrupted run) and adapter export.
+`--compile` (default on) compiles each decoder layer with inductor's `emulate_precision_casts`, so
+intermediates are rounded to bf16 exactly as in eager mode; without it the untrained eval loss already moves
+(2.19903 -> 2.19883) and grad norms drift. The first step after each launch compiles (about a minute; faster
+with a warm cache). `--compile-cache` must sit on a filesystem that allows executables: a `noexec` /dev/shm
+fails with "failed to map segment from shared object". `--no-compile` runs eager.
+
+Verified for this release (4x H100, compile on): save, resume (step-3 loss 2.32517 against 2.32492-2.32522 for
+uninterrupted runs) and adapter export (1,120 LoRA tensors, plain PEFT names).
 `--forward-prefetch` is kept for compatibility and has no effect (FSDP2 prefetches on its own).
 
 The full 52M-token run in the previous release ran at ~835 tokens/s on the real mix. With these defaults
@@ -143,3 +151,22 @@ llama-server -m base-f16.gguf --lora adapter-f16.gguf
 llama.cpp applies LoRA at `alpha / r`; rsLoRA adapters train at `alpha / sqrt(r)`, so converting the
 config as-is would load them about sqrt(r) times too weak. `lora_to_gguf.py` writes the trained scale
 into the GGUF's alpha. (In current llama.cpp, a manual scale is passed as `--lora-scaled FILE:SCALE`, one argument.)
+
+## Notes
+
+### Ripple's `value_res_lambda` and weight alignment
+
+Every attention block in Ripple has a one-element bf16 parameter, `self_attn.value_res_lambda`. Anything that
+flattens or packs a layer's parameters into one buffer (FSDP1 flat parameters, custom gradient buckets, other
+frameworks) puts every weight after it at a 2-byte offset. cuBLAS then cannot use its fast kernels and falls back
+to `cutlass_75_tensorop_bf16_s1688gemm_..._align1`: measured 100 vs 803 TFLOPs for the same 8192x5120x40960
+matmul on H100, and the same kernel dominated an 8x A100 profile. Use per-parameter storage (FSDP2, as here) or
+pad every parameter to 16 bytes. Check with `weight.data_ptr() % 16` inside a forward pre-hook.
+
+### Selective activation checkpointing on 8 GPUs
+
+Every decoder layer is recomputed in the backward. On 4x H100-80 at micro-batch 4 there is no room to keep any
+layer's activations: leaving even 10 of 80 layers un-checkpointed runs out of memory (more than 2.4 GB of
+activations per layer, ~24 GB headroom). On 8x H100-80 the sharded base and LoRA/AdamW state per GPU halve
+(~+20 GB headroom) and global batch 16 becomes micro-batch 2 (half the activations per layer), so skipping
+recompute on some layers may fit there and save part of the ~25% of compute spent recomputing. Untested.
