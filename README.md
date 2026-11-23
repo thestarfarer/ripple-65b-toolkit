@@ -7,10 +7,11 @@ Tooling for training and serving LoRA adapters on
 
 | file | description |
 |---|---|
-| `ripple_fsdp.py`, `train_rank_probe.py` | FSDP LoRA trainer for 2+ GPUs. rsLoRA with alpha = sqrt(512*r), fp32 LoRA master weights and optimizer state, resumable, dataset and topology checks on resume. |
+| `ripple_fsdp.py`, `train_rank_probe.py`, `train_2048.py` | FSDP LoRA trainer for 2+ GPUs. rsLoRA with alpha = sqrt(512*r), fp32 LoRA master weights and optimizer state, resumable, dataset and topology checks on resume. |
 | `packed_data.py` | Packed-window collator: block-diagonal 4D attention masks, per-segment position ids, first-token label masking. |
 | `ripple_lora_plugin.py` | Registers a `SupportsLoRA` subclass of vLLM's ricursive model at runtime. No vLLM rebuild required. |
 | `validate_vllm_stage.py`, `validate_hf_stage.py` | Correctness check for the plugin: compares per-token adapter deltas (logprob with adapter minus without) between vLLM and transformers+PEFT. |
+| `lora_to_gguf.py` | Converts an adapter to a llama.cpp LoRA GGUF, folding the rsLoRA scale so plain `--lora` applies it at the trained strength. |
 | `merge_lora_to_gguf.py` | Merges an adapter into the base weights inside llama.cpp's HF-to-GGUF conversion, streaming tensor by tensor; no merged HF checkpoint is written. |
 
 ## Versions
@@ -37,6 +38,29 @@ at ~72.7 GiB per GPU, r64 at ~74.5 GiB. For r64 use `--eval-batch 8`: evals
 after the first optimizer step allocate on top of optimizer state and OOM at
 batch 16. r128 does not fit on 2x80.
 
+2048 stage, packed rows (`{"packed": [segment, ...]}`; each segment attends only to itself):
+
+```
+torchrun --standalone --nproc_per_node=4 train_2048.py --fresh-adapter \
+  --train-file mix_2048.jsonl --data-format packed --max-length 2048 \
+  --rank 128 --lr 1e-6 --warmup 100 --global-batch 16 --micro-batch 4 --eval-batch 8 \
+  --forward-prefetch --no-append-eos --save-steps 250 --output-dir out/r128
+```
+
+Measured on 4x H100-80 SXM (NVLink), r128: peak 52.9 GiB per GPU at micro-batch 4 on full
+2,048-token rows (eval batch 8 included), ~835 tokens/s, ~38 s per optimizer step of 16 rows.
+For comparison, 8x A100-80 SXM ran the same r128 2048 stage at 831 tokens/s.
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` was set for that run.
+
+Plain-text rows get an EOS appended by default; pass `--no-append-eos` for continuation-style
+training. No BOS is ever added. Resumable checkpoints at r128 are ~29 GB (4 optimizer shards + adapter).
+
+Throughput note: at ~835 tokens/s the 4x H100 run reaches ~82 TFLOPs per GPU (~8% of bf16 peak),
+with memory controllers 11-27% busy, NVLink ~1% busy and clocks unthrottled. Ripple's attention calls
+`F.scaled_dot_product_attention` with an explicit sliding-window mask (no flash-attention support in its
+modeling code), and packed training adds a block-diagonal 4D mask; where the time goes has not been
+profiled yet.
+
 ## Serving
 
 ```python
@@ -48,6 +72,10 @@ llm = LLM(model="ricursiveAI/Ripple-65B-Base-Preview", tensor_parallel_size=2,
           trust_remote_code=True, enable_lora=True, max_lora_rank=64)
 out = llm.generate(prompts, params, lora_request=LoRARequest("a", 1, "out/r32/final"))
 ```
+
+vLLM starts tensor-parallel workers with `spawn`, which re-imports your script in every worker:
+call `register()` at module level (the workers need it too) and put the generation itself under
+`if __name__ == "__main__":`.
 
 ## Validation
 
@@ -86,3 +114,15 @@ All arguments other than `--llama-cpp` and `--adapter` go to the converter uncha
 but needs RAM for the whole model). The run must end with a `MERGE_OK` line, which is printed only when
 every adapter tensor pair was applied. A cheap end-to-end check is `llama-perplexity` on held-out text:
 the merged file must reproduce the adapter's loss drop against the base.
+
+To keep the adapter separate instead of merging (one base GGUF, many adapters):
+
+```
+python lora_to_gguf.py --llama-cpp path/to/llama.cpp --base path/to/Ripple-65B-Base-Preview \
+  --adapter path/to/adapter --outfile adapter-f16.gguf
+llama-server -m base-f16.gguf --lora adapter-f16.gguf
+```
+
+llama.cpp applies LoRA at `alpha / r`; rsLoRA adapters train at `alpha / sqrt(r)`, so converting the
+config as-is would load them about sqrt(r) times too weak. `lora_to_gguf.py` writes the trained scale
+into the GGUF's alpha. (In current llama.cpp, a manual scale is passed as `--lora-scaled FILE:SCALE`, one argument.)
