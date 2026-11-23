@@ -8,7 +8,7 @@ scale = alpha / sqrt(r) for rsLoRA adapters, alpha / r otherwise.
 
 Usage:
   python merge_lora_to_gguf.py --llama-cpp LLAMA_CPP_DIR --adapter ADAPTER_DIR \
-      BASE_MODEL_DIR --outtype q8_0 --outfile merged-Q8_0.gguf [--split-max-size 45G]
+      BASE_MODEL_DIR --outtype q8_0 --no-lazy --outfile merged-Q8_0.gguf [--split-max-size 45G]
 
 Every argument after the two wrapper flags is passed to convert_hf_to_gguf unchanged.
 The run ends with a MERGE_OK line only if every adapter tensor pair was applied.

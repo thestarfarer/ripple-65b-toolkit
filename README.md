@@ -97,15 +97,17 @@ Requirements: a llama.cpp checkout with `RicursiveForCausalLM` support and its c
 
 ```
 python merge_lora_to_gguf.py --llama-cpp path/to/llama.cpp --adapter path/to/adapter \
-  path/to/Ripple-65B-Base-Preview --outtype q8_0 --split-max-size 45G --outfile merged-Q8_0.gguf
+  path/to/Ripple-65B-Base-Preview --outtype q8_0 --no-lazy --split-max-size 45G --outfile merged-Q8_0.gguf
 
 path/to/llama.cpp/build/bin/llama-quantize --allow-requantize \
   merged-Q8_0-00001-of-00002.gguf merged-Q4_K_M.gguf Q4_K_M
 ```
 
 All arguments other than `--llama-cpp` and `--adapter` go to the converter unchanged
-(`--split-max-size 45G` keeps each file under the Hugging Face 50 GB limit; `--no-lazy` converts faster
-but needs RAM for the whole model). The run must end with a `MERGE_OK` line, which is printed only when
+(`--split-max-size 45G` keeps each file under the Hugging Face 50 GB limit). Pass `--no-lazy`: current
+llama.cpp converters load tensors lazily on the meta device, and adding the CPU LoRA delta to them fails
+(`Tensor on device cpu is not on the expected device meta!`, `MERGE_INCOMPLETE merged=0`). `--no-lazy`
+needs RAM for the whole model; a 65B r128 merge to Q8_0 took 13 min on a 2x Xeon 8480+ box. The run must end with a `MERGE_OK` line, which is printed only when
 every adapter tensor pair was applied. A cheap end-to-end check is `llama-perplexity` on held-out text:
 the merged file must reproduce the adapter's loss drop against the base.
 
